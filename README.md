@@ -9,7 +9,7 @@ This analysis quantifies the **average wholesale unit cost (UC, $/MWh)** of serv
 | Portfolio | Load definition | Size |
 |-----------|-----------------|------|
 | **Non‑solar cohort** | Total half‑hourly consumption of each Ausgrid customer | 300 |
-| **Solar cohort** | **Net** consumption after 6.6 kW PV generation (export curtailed) | 300 |
+| **Solar cohort** | **Net** consumption after rooftop PV generation | 300 |
 
 We examine two cases:
 
