@@ -1,0 +1,268 @@
+---
+title: "2. Wholesale_prices"
+format: html
+editor: visual
+---
+
+## 0. What this script does
+
+## 1. Initialise
+
+Load required packages
+
+```{r}
+#| message: false
+#| echo: false
+#| results: 'hide'
+
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(lubridate)
+library(ggplot2)
+library(patchwork)
+library(readr)
+library(reshape2)
+library(gganimate)
+library(magick)
+library(gifski)
+```
+
+## 2. Load and clean wholesale prices
+
+Load cached wholesale prices or download from AEMO\
+(Note: It automatically (re-)downloads the latest two months of price data)
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+
+# Define parameters
+start_date <- ymd("2005-01-01")
+end_date <- ceiling_date(Sys.Date(), "month") - days(1)  # Dynamic last day of current month
+states <- c("NSW1", "VIC1", "QLD1", "SA1", "TAS1")
+
+# Create list of year-month combinations
+months_seq <- seq(start_date, end_date, by = "month")
+ym_list <- format(months_seq, "%Y%m")
+
+# Identify last 2 months to force re-download
+last_two_months <- tail(ym_list, 2)
+
+# Base URL
+base_url <- "https://aemo.com.au/aemo/data/nem/priceanddemand"
+
+# Download and read files
+all_data <- list()
+
+for (state in states) {
+  for (ym in ym_list) {
+    file_name <- paste0("PRICE_AND_DEMAND_", ym, "_", state, ".csv")
+    file_path <- file.path("02-nem-wholesale-price", file_name)
+    file_url <- paste0(base_url, "/", file_name)
+
+    # Force download if in last 2 months or not already downloaded
+    force_download <- ym %in% last_two_months
+
+    if (!file.exists(file_path) || force_download) {
+      message("Downloading ", file_name)
+      tryCatch({
+        download.file(file_url, destfile = file_path, quiet = TRUE)
+      }, error = function(e) {
+        message("Failed to download: ", file_name)
+      })
+    }
+
+    # Read if successfully downloaded
+    if (file.exists(file_path)) {
+      dt <- tryCatch({
+        fread(file_path)
+      }, error = function(e) {
+        message("Failed to read: ", file_name)
+        NULL
+      })
+
+      if (!is.null(dt)) {
+        dt[, REGION := state]
+        dt[, YEAR_MONTH := ym]
+        all_data[[length(all_data) + 1]] <- dt
+      }
+    }
+  }
+}
+
+# Combine all into a single data.table
+nem_combined_data <- rbindlist(all_data, fill = TRUE)
+
+# Preview
+print(nem_combined_data)
+```
+
+```{r}
+#| message: false
+
+# Convert the SETTLEMENTDATE column (a character string) to POSIXct in Australia/Brisbane
+nem_combined_data[, Settlement_DateTime := as.POSIXct(SETTLEMENTDATE, 
+  format = "%Y/%m/%d %H:%M:%S", tz = "Australia/Brisbane")]
+
+# Create a new column for the half-hour starting time by subtracting 30 minutes
+nem_combined_data[, Settlement_Start := Settlement_DateTime - 30*60]
+
+# Create a new column for the 30-minute interval start by flooring Settlement_Start.
+nem_combined_data[, Interval_Start := floor_date(Settlement_Start, unit = "30 minutes")]
+
+# Group by REGION and Interval_Start to compute weighted avg wholesale prices
+nem_30min <- nem_combined_data[, .(
+  TOTALDEMAND = sum(TOTALDEMAND, na.rm = TRUE),
+  RRP_weighted = sum(TOTALDEMAND * RRP, na.rm = TRUE) / sum(TOTALDEMAND, na.rm = TRUE)
+), by = .(REGION, Interval_Start)]
+
+print(nem_30min)
+```
+
+Export combined wholesale prices
+
+```{r}
+
+# Define file paths for CSV and RDS outputs
+csv_file <- file.path("02-nem-wholesale-price", "nem_30min_prices.csv")
+rds_file <- file.path("02-nem-wholesale-price", "nem_30min_prices.rds")
+
+# Export as CSV using fwrite for speed
+fwrite(nem_30min, csv_file)
+
+# Export as an RDS object (to preserve data types and attributes)
+saveRDS(nem_30min, rds_file)
+
+cat("Exported nem_30min to CSV and RDS.\n")
+```
+
+## 3. Analysis
+
+### Average wholesale price
+
+Prepare data and function for plotting
+
+```{r}
+
+# Add columns for plotting
+nem_30min[, Time_30min := format(Interval_Start, "%H:%M")]
+nem_30min[, Hour := as.integer(substr(Time_30min, 1, 2))]
+nem_30min[, Minute := as.integer(substr(Time_30min, 4, 5))]
+nem_30min[, Time_num := Hour + Minute / 60]
+nem_30min[, Month_Label := paste0(month(Interval_Start, label = TRUE, abbr = TRUE), " ", year(Interval_Start))]
+nem_30min[, Month_Label := factor(Month_Label, levels = unique(Month_Label))]  # Optional: ensure chronological order
+
+# Function to plot average RRP
+plot_avg_rrp <- function(data, region, year) {
+  region_data <- data[REGION == region & year(Interval_Start) == year]
+  if (nrow(region_data) == 0) {
+    message("No data for ", region, " in ", year)
+    return(NULL)
+  }
+
+  # Aggregate to get average RRP
+  avg_data <- region_data[, .(
+    Avg_RRP = mean(RRP_weighted, na.rm = TRUE),
+    Month = month(Interval_Start)
+  ), by = .(Month_Label, Time_num)]
+
+  setorder(avg_data, Month, Time_num)
+
+  p <- ggplot(avg_data, aes(x = Time_num, y = Avg_RRP, group = 1)) +
+    geom_line(linewidth = 1, color = "black") +
+    facet_wrap(~Month_Label, ncol = 4) +
+    labs(
+      title = paste0("Avg Half-Hourly Wholesale Price – ", region, " – ", year),
+      x = "Hour of Day",
+      y = "Avg RRP ($/MWh)"
+    ) +
+    scale_x_continuous(breaks = seq(0, 24, by = 2), labels = seq(0, 24, by = 2)) +
+    theme_minimal() +
+    theme(
+      text = element_text(size = 11),
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      legend.position = "none",
+      axis.text.x = element_text(angle = 0, hjust = 1)
+    )
+  return(p)
+}
+
+```
+
+Plot average wholesale prices
+
+```{r}
+p <- plot_avg_rrp(nem_30min, "NSW1", 2023)
+
+p
+```
+
+### Year-month boxplot per region
+
+```{r}
+# Function to create boxplot GIF for a region
+create_boxplot_gif <- function(data, region) {
+  region_data <- data[REGION == region]
+  if (nrow(region_data) == 0) {
+    message("No data for ", region)
+    return(NULL)
+  }
+
+  # Prepare data
+  region_data[, YEAR_MONTH := sprintf("%04d%02d", Year, Month)]
+  region_data[, time_interval := Time_30min]
+  region_data[, time_interval := factor(time_interval, levels = sort(unique(Time_30min)))]
+
+  # Compute global y-axis limits
+  global_stats <- region_data[, .(
+    lower = boxplot.stats(RRP)$stats[1],
+    upper = boxplot.stats(RRP)$stats[5],
+    avg = mean(RRP, na.rm = TRUE)
+  ), by = .(YEAR_MONTH, time_interval)]
+
+  global_lower <- min(global_stats$lower, global_stats$avg, na.rm = TRUE)
+  global_upper <- 500  # Adjust as needed
+
+  # Directory for frames
+  dir_name <- paste0("monthly_frames_", region)
+  dir.create(dir_name, showWarnings = FALSE)
+
+  # Generate plots for each month
+  months <- unique(region_data$YEAR_MONTH)
+  for (m in months) {
+    month_data <- region_data[YEAR_MONTH == m]
+
+    p <- ggplot(month_data, aes(x = time_interval, y = RRP)) +
+      geom_boxplot() +
+      stat_summary(fun = mean, geom = "point", shape = 16, size = 2, color = "blue") +
+      coord_cartesian(ylim = c(global_lower, global_upper)) +
+      labs(
+        title = paste("Wholesale Prices –", region, "–", m),
+        x = "Time Interval (30-min intervals)",
+        y = "Wholesale Prices ($/MWh)"
+      ) +
+      theme(
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        plot.title = element_text(size = 16, face = "bold")
+      )
+
+    # Save plot
+    ggsave(filename = file.path(dir_name, paste0("boxplot_", m, ".png")), plot = p, width = 12, height = 6)
+  }
+
+  # Create GIF
+  img_files <- list.files(dir_name, pattern = "*.png", full.names = TRUE)
+  img_list <- image_read(img_files)
+  img_animated <- image_animate(image_join(img_list), fps = 4)
+  image_write(img_animated, paste0(region, "_boxplot_animation.gif"))
+  message("GIF created for ", region)
+}
+
+# Automate for all regions
+for (region in states) {
+  create_boxplot_gif(nem_30min, region)
+}
+```

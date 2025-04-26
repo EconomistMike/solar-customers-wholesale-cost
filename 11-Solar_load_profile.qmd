@@ -1,0 +1,589 @@
+---
+title: "Ausgrid Solar Customer Data Preparation and Analysis"
+author: "Michael Wu"
+format: html
+editor: visual
+---
+
+## 0. What this script does
+
+Combine and clean Ausgrid solar customer data from 2010-11 to 2012-13. Results are analysed and exported for later modelling purpose in script `13-model_wholesale_cost`.
+
+## 1. Tools
+
+Load required packages
+
+```{r}
+#| message: false
+
+library(data.table)
+library(lubridate)
+library(tidyr)
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(ggspatial)
+library(rnaturalearth)
+```
+
+## 2. Clean and Export Ausgrid Solar Customer Data
+
+### Load and clean data
+
+Load and combine Ausgrid solar customer data in three csv files (2010-11 to 2012-13), extracting financial year from filenames
+
+```{r}
+#| message: false
+
+# Define path and CSV file pattern
+folder_path <- "01-ausgrid-solar-customers"
+csv_files <- list.files(
+  path       = folder_path, 
+  pattern    = "Solar home electricity data.*\\.csv$", 
+  full.names = TRUE
+)
+
+# Load and combine CSV files
+ausgrid_list <- lapply(csv_files, function(f) {
+  dt <- fread(f, skip = 1, fill = TRUE)
+  setnames(dt, gsub(" ", "_", names(dt)))
+  if ("Row_Quality" %in% names(dt)) {
+    dt[, Row_Quality := NULL]
+  }
+  dt[, date := as.Date(date, tryFormats = c("%d-%b-%y", "%d/%m/%Y"))]
+  year_val <- regmatches(f, regexpr("\\d{4}", f))
+  if (length(year_val) > 0) {
+    fy <- paste0(year_val, "-", substr(as.integer(year_val) + 1, 3, 4))
+    dt[, Year := fy]
+  } else {
+    dt[, Year := NA_character_]
+  }
+  return(dt)
+})
+
+dt_ausgrid <- rbindlist(ausgrid_list, fill = TRUE)
+
+print(dt_ausgrid)
+```
+
+### Reshape to Long Format with Timestamp
+
+Convert to long format and create a `Timestamp` column, dropping unnecessary intermediates.
+
+```{r}
+# Identify half-hourly time columns
+time_cols <- grep(
+  pattern = "^([0-1]?\\d|2[0-3]):[0-5]\\d$|^0:00$", 
+  x       = names(dt_ausgrid),
+  value   = TRUE
+)
+
+# Melt to long format
+dt_ausgrid_long <- melt(
+  data         = dt_ausgrid,
+  id.vars      = c("Customer", "Postcode", "Generator_Capacity", 
+                   "Consumption_Category", "date", "Year"),
+  measure.vars = time_cols,
+  variable.name = "Time",
+  value.name    = "kWh"
+)
+setDT(dt_ausgrid_long)
+
+# Create Timestamp and drop intermediate columns
+dt_ausgrid_long[, c("Hour", "Minute") := tstrsplit(Time, ":", fixed = TRUE)]
+dt_ausgrid_long[, Hour := as.integer(Hour)]
+dt_ausgrid_long[, Minute := as.integer(Minute)]
+dt_ausgrid_long[, Timestamp := as.POSIXct(date) + (Hour * 3600 + Minute * 60)]
+dt_ausgrid_long[, c("date", "Time", "Hour", "Minute") := NULL]
+```
+
+### Cast to Wide Format and Compute Metrics
+
+Reshape to wide format and calculate consumption metrics
+
+```{r}
+
+dt_ausgrid_customer_long <- dcast(
+  dt_ausgrid_long,
+  Customer + Postcode + Timestamp + Generator_Capacity ~ Consumption_Category,
+  value.var = "kWh",
+  fill = 0,
+  fun.aggregate = sum
+)
+setDT(dt_ausgrid_customer_long)
+
+# Calculate Total and Net Consumption
+dt_ausgrid_customer_long[, Total_Consmp := GC + CL]
+dt_ausgrid_customer_long[, Net_Consmp := pmax(Total_Consmp - GG, 0)]
+```
+
+### Data validation
+
+Validate wide vs long aggregate by Customer and Consumption Category
+
+```{r}
+#| eval: false
+# Aggregate from wide dataset
+dt_wide_agg <- dt_ausgrid[, .(Row_Total = rowSums(.SD, na.rm = TRUE)),
+                          by = .(Customer, Consumption_Category),
+                          .SDcols = time_cols]
+dt_wide_agg <- dt_wide_agg[, .(Wide_Total = sum(Row_Total, na.rm = TRUE)),
+                           by = .(Customer, Consumption_Category)]
+
+# Aggregate from long dataset
+dt_long_agg <- dt_ausgrid_long[, .(Long_Total = sum(kWh, na.rm = TRUE)),
+                               by = .(Customer, Consumption_Category)]
+
+# Compare aggregates
+dt_compare <- merge(dt_wide_agg, dt_long_agg,
+                    by = c("Customer", "Consumption_Category"),
+                    all = TRUE)
+dt_compare[, Match := mapply(function(a, b) isTRUE(all.equal(a, b, tolerance = 1e-9)), Wide_Total, Long_Total)]
+dt_customer_check <- dt_compare[, .(All_Match = all(Match)), by = Customer]
+percent_correct <- mean(dt_customer_check$All_Match) * 100
+cat("Percentage of customers correctly processed:", percent_correct, "%\n")
+```
+
+### Export
+
+```{r}
+
+# Reorder columns
+setcolorder(dt_ausgrid_customer_long, c("Customer", "Postcode", "Timestamp", "Generator_Capacity", 
+                                        "CL", "GC", "GG", "Total_Consmp", "Net_Consmp"))
+
+# RDS Export
+folder_path <- "01-ausgrid-solar-customers"
+rds_file <- file.path(folder_path, "dt_ausgrid_long.rds")
+saveRDS(dt_ausgrid_customer_long, rds_file)
+
+# CSV export
+csv_file <- file.path(folder_path, "dt_ausgrid_long.csv")
+fwrite(dt_ausgrid_customer_long, csv_file)
+```
+
+## 3. Analysis
+
+### Plot Ausgrid customer location in NSW
+
+```{r}
+
+# Load the POA shapefile
+poa_shp <- st_read("01-ausgrid-solar-customers/POA_2021_AUST_GDA2020_SHP/POA_2021_AUST_GDA2020.shp")
+
+# Load the State/Territory shapefile for NSW boundary
+ste_shp <- st_read("01-ausgrid-solar-customers/POA_2021_AUST_GDA2020_SHP/STE_2021_AUST_GDA2020.shp")
+nsw_shp <- ste_shp %>% filter(STE_NAME21 == "New South Wales")
+
+# Prepare customer postcodes
+customer_postcodes <- unique(dt_ausgrid_customer_long[, .(Customer, Postcode)])
+customer_postcodes[, Postcode_char := as.character(Postcode)]
+
+# Ensure Customer column type consistency
+customer_postcodes[, Customer := as.integer(Customer)]
+dt_ausgrid_customer_long[, Customer := as.integer(Customer)]
+
+# Filter POA shapefile to relevant postcodes
+data_postcodes <- unique(customer_postcodes$Postcode_char)
+poa_shp_filtered <- poa_shp %>% filter(POA_CODE21 %in% data_postcodes)
+
+# Debug: Check for unmatched postcodes
+unmatched_postcodes <- setdiff(data_postcodes, poa_shp$POA_CODE21)
+if (length(unmatched_postcodes) > 0) {
+  warning("Postcodes not found in shapefile: ", paste(unmatched_postcodes, collapse = ", "))
+}
+
+# Assign coordinates to customers
+customer_coords_list <- list()
+for (pc in data_postcodes) {
+  polygon <- poa_shp_filtered %>% filter(POA_CODE21 == pc) %>% st_geometry()
+  if (length(polygon) == 0) {
+    warning(paste("No polygon found for postcode", pc))
+    next
+  }
+  customers <- customer_postcodes %>% filter(Postcode_char == pc) %>% pull(Customer)
+  n <- length(customers)
+  if (n == 1) {
+    point <- st_centroid(polygon)
+    coords <- st_coordinates(point)
+    df <- data.frame(Customer = customers, Longitude = coords[1], Latitude = coords[2])
+  } else {
+    points <- st_sample(polygon, size = n, type = "random")
+    if (length(points) < n) {
+      warning(paste("Could not generate enough points for postcode", pc, "- using centroid instead"))
+      points <- rep(st_centroid(polygon), n)
+    }
+    coords <- st_coordinates(points)
+    df <- data.frame(Customer = customers, Longitude = coords[,1], Latitude = coords[,2])
+  }
+  customer_coords_list[[pc]] <- df
+}
+
+# Combine all customer coordinates
+if (length(customer_coords_list) == 0) {
+  stop("No coordinates generated. Check if postcodes match between data and shapefile.")
+}
+customer_coords <- do.call(rbind, customer_coords_list)
+
+# Ensure Customer column type in customer_coords matches
+customer_coords$Customer <- as.integer(customer_coords$Customer)
+
+# Debug: Check Customer ID coverage
+missing_customers <- setdiff(dt_ausgrid_customer_long$Customer, customer_coords$Customer)
+if (length(missing_customers) > 0) {
+  warning("Customers in dt_ausgrid_customer_long not in customer_coords: ", 
+          paste(head(missing_customers, 10), collapse = ", "), 
+          if (length(missing_customers) > 10) " (and more)" else "")
+}
+
+# Join coordinates back to the main dataset
+dt_ausgrid_customer_long <- dt_ausgrid_customer_long %>% 
+  left_join(customer_coords, by = "Customer")
+
+# Check for missing coordinates
+missing_coords <- dt_ausgrid_customer_long %>% filter(is.na(Longitude))
+if (nrow(missing_coords) > 0) {
+  warning(paste("There are", nrow(missing_coords), "rows with missing coordinates."))
+  print("Sample of missing coordinate rows (first 6):")
+  print(head(missing_coords, 6))
+}
+
+# Visualize customers with NSW boundary and adjusted grid lines
+ggplot() +
+  geom_sf(data = nsw_shp, fill = NA, colour = "gray50") +
+  geom_point(data = customer_coords, aes(x = Longitude, y = Latitude), size = 1, alpha = 0.5, colour = "blue") +
+  coord_sf(xlim = c(150.75, 152.25), ylim = c(-34.24, -32.5), crs = st_crs(nsw_shp)) +
+  scale_x_continuous(breaks = seq(151.0, 152.0, by = 0.5)) +
+  scale_y_continuous(breaks = seq(-34.5, -32.5, by = 0.5)) +
+  theme_minimal() +
+  labs(title = "Ausgrid Customer Locations in NSW",
+       x = "Longitude", y = "Latitude")
+```
+
+### Analyse annual consumption data
+
+```{r}
+#| warning: false
+#| message: false
+
+# Precompute month and year in vectorized form
+dt_ausgrid_customer_long[, `:=`(
+  ts_month = month(Timestamp),
+  ts_year  = year(Timestamp)
+)]
+# Now compute FY using the precomputed values
+dt_ausgrid_customer_long[, FY := ifelse(ts_month >= 7,
+  paste0(ts_year, "-", substr(as.character(ts_year + 1), 3, 4)),
+  paste0(ts_year - 1, "-", substr(as.character(ts_year), 3, 4))
+)]
+# Remove the temporary columns
+dt_ausgrid_customer_long[, c("ts_month", "ts_year") := NULL]
+
+annual_consumption <- dt_ausgrid_customer_long[, .(
+  Annual_TC = sum(Total_Consmp, na.rm = TRUE),
+  Annual_Net = sum(Net_Consmp, na.rm = TRUE)
+), by = .(Customer, FY)]
+
+# Melt to long format for easier plotting
+consumption_long <- melt(annual_consumption,
+                         id.vars = c("Customer", "FY"),
+                         variable.name = "Consumption_Type",
+                         value.name = "kWh")
+
+# Plot
+ggplot(consumption_long, aes(x = FY, y = kWh, fill = Consumption_Type)) +
+  geom_boxplot(width = 0.6, position = position_dodge(width = 0.8)) +
+  stat_summary(
+    aes(group = Consumption_Type),
+    fun = median,
+    geom = "point",
+    shape = 21,
+    fill = "white",
+    size = 2.5,
+    position = position_dodge(width = 0.8)
+  ) +
+  labs(
+    title = "Annual Consumption Range (Total vs Net)",
+    y = "Annual Consumption (kWh)", 
+    x = NULL, 
+    fill = "Type"
+  ) +
+  scale_fill_manual(
+    values = c("Annual_TC" = "blue", "Annual_Net" = "orange"),
+    labels = c("Total Consumption", "Net Consumption")
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 12),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+```
+
+### Plotting Ausgrid customer consumption
+
+Define plotting function for consumption quantiles
+
+```{r}
+plot_quantiles <- function(data, title, facet_var = NULL, x = "Hour + Minute / 60") {
+  # Create a copy of the data to avoid modifying the original
+  data <- copy(data)
+  
+  # Create a new column for the x-axis value based on the expression
+  data[, x_value := eval(parse(text = x))]
+  
+  # Identify percentile columns (e.g., "median", "p05", "p25", "p75", "p95", etc.)
+  percentile_cols <- names(data)[grepl("^(median|p[0-9]{1,2})$", names(data))]
+  
+  # If no percentile columns are found, stop with an error
+  if (length(percentile_cols) == 0) {
+    stop("No percentile columns found in the data. Expected columns like 'median', 'p05', 'p25', etc.")
+  }
+  
+  # Create a mapping of percentile columns to their display labels
+  quantile_labels <- sapply(percentile_cols, function(q) {
+    if (q == "median") "Median"
+    else if (q == "p05") "5th Percentile"
+    else if (q == "p25") "25th Percentile"
+    else if (q == "p75") "75th Percentile"
+    else if (q == "p95") "95th Percentile"
+    else paste0(gsub("p", "", q), "th Percentile")
+  })
+  
+  # Create a long-format data frame for plotting using data.table's melt
+  id_vars <- "x_value"
+  if (!is.null(facet_var)) {
+    id_vars <- c(id_vars, facet_var)
+  }
+  data_long <- melt(data, id.vars = id_vars,
+                    measure.vars = percentile_cols,
+                    variable.name = "Quantile",
+                    value.name = "Value")
+  # Ensure data_long is a data.table
+  data_long <- as.data.table(data_long)
+  
+  # Convert Quantile to a factor with renamed levels (using data.table syntax)
+  data_long[, Quantile := factor(Quantile, levels = percentile_cols, labels = quantile_labels)]
+  
+  # Define base colors, linetypes, and linewidths using the renamed labels
+  base_colors <- c(
+    "Median" = "black",
+    "5th Percentile" = "lightblue",
+    "25th Percentile" = "blue",
+    "75th Percentile" = "coral",
+    "95th Percentile" = "lightcoral"
+  )
+  base_linetypes <- c(
+    "Median" = "solid",
+    "5th Percentile" = "solid",
+    "25th Percentile" = "solid",
+    "75th Percentile" = "solid",
+    "95th Percentile" = "solid"
+  )
+  base_linewidths <- c(
+    "Median" = 1,
+    "5th Percentile" = 0.8,
+    "25th Percentile" = 0.8,
+    "75th Percentile" = 0.8,
+    "95th Percentile" = 0.8
+  )
+  
+  # Create color, linetype, and linewidth mappings for all quantile labels
+  colors <- sapply(levels(data_long$Quantile), function(label) {
+    if (label %in% names(base_colors)) {
+      base_colors[[label]]
+    } else {
+      "grey50"  # Default color for other percentiles
+    }
+  })
+  linetypes <- sapply(levels(data_long$Quantile), function(label) {
+    if (label %in% names(base_linetypes)) {
+      base_linetypes[[label]]
+    } else {
+      if (grepl("^[0-2][0-9]th Percentile|[8-9][0-9]th Percentile", label)) "dashed" else "solid"
+    }
+  })
+  linewidths <- sapply(levels(data_long$Quantile), function(label) {
+    if (label %in% names(base_linewidths)) {
+      base_linewidths[[label]]
+    } else {
+      if (grepl("^[0-2][0-9]th Percentile|[8-9][0-9]th Percentile", label)) 0.6 else 0.8
+    }
+  })
+  
+  # Create the plot
+  p <- ggplot(data_long, aes(x = x_value, y = Value, color = Quantile, linetype = Quantile)) +
+    geom_line(aes(linewidth = Quantile)) +
+    scale_color_manual(values = colors) +
+    scale_linetype_manual(values = linetypes) +
+    scale_linewidth_manual(values = linewidths) +
+    scale_x_continuous(breaks = seq(0, 24, by = 2), labels = seq(0, 24, by = 2)) +
+    labs(
+      title = title,
+      x = "Hour of Day",
+      y = "Consumption (kWh)",
+      color = "Quantile",
+      linetype = "Quantile",
+      linewidth = "Quantile"
+    ) +
+    theme_minimal() +
+    theme(
+      text = element_text(size = 11),
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      legend.position = "bottom",
+      axis.text.x = element_text(angle = 0, hjust = 1)
+    )
+  
+  # Add faceting if a facet variable is provided
+  if (!is.null(facet_var)) {
+    p <- p + facet_wrap(as.formula(paste("~", facet_var)), ncol = 4, labeller = label_value)
+  }
+  
+  # Display the plot
+  print(p)
+}
+```
+
+### Plot 1: Quantiles by Financial Year, Month, Time of Day
+
+```{r}
+
+# Set grouping variable
+group_by <- "FY"  # Fiscal year grouping
+
+# Create new columns for Month and Time_of_Day from Timestamp
+dt_ausgrid_customer_long[, Month := month(Timestamp)]
+dt_ausgrid_customer_long[, Time_of_Day := hour(Timestamp) + minute(Timestamp)/60]
+# (Optional: keep Hour and Minute as separate columns if needed elsewhere)
+dt_ausgrid_customer_long[, Hour := hour(Timestamp)]
+dt_ausgrid_customer_long[, Minute := minute(Timestamp)]
+
+# Create a Month_Name column (e.g., "Jul", "Aug", etc.)
+dt_ausgrid_customer_long[, Month_Name := month.abb[Month]]
+
+# Compute quantiles grouped by FY, Month (or Month_Name) and Time_of_Day only
+quantiles_by_month <- dt_ausgrid_customer_long[, .(
+  median = quantile(Total_Consmp, 0.5, na.rm = TRUE),
+  p25    = quantile(Total_Consmp, 0.25, na.rm = TRUE),
+  p75    = quantile(Total_Consmp, 0.75, na.rm = TRUE)
+), by = .(FY, Month, Month_Name, Time_of_Day)]
+
+# Extract start and end years from FY (e.g., "2010-11" -> 2010 and 2011)
+quantiles_by_month[, start_year := as.integer(substr(FY, 1, 4))]
+quantiles_by_month[, end_year := as.integer(paste0("20", substr(FY, 6, 7)))]
+
+# Assign calendar year based on Month:
+# For months July (7) to December (12), use start_year; for Jan-Jun, use end_year.
+quantiles_by_month[, calendar_year := ifelse(Month >= 7, start_year, end_year)]
+
+# Create Month_Label using Month_Name and calendar_year
+quantiles_by_month[, Month_Label := paste0(Month_Name, " ", calendar_year)]
+
+# Define the financial year month order (Jul to Jun)
+fy_month_order <- c("Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr", "May", "Jun")
+
+# Create a numerical order for months within the fiscal year using Month_Name
+quantiles_by_month[, fy_month_num := match(Month_Name, fy_month_order)]
+
+# Sort the data by FY and fiscal month number
+setorderv(quantiles_by_month, c("FY", "fy_month_num"))
+
+# Set Month_Label factor levels in chronological fiscal year order
+ordered_levels <- unlist(lapply(unique(quantiles_by_month$FY), function(fy) {
+  start_yr <- as.integer(substr(fy, 1, 4))
+  end_yr   <- as.integer(paste0("20", substr(fy, 6, 7)))
+  c(paste0(fy_month_order[1:6], " ", start_yr), paste0(fy_month_order[7:12], " ", end_yr))
+}))
+quantiles_by_month[, Month_Label := factor(Month_Label, levels = ordered_levels)]
+
+# Remove temporary columns not needed for plotting
+quantiles_by_month[, c("start_year", "end_year", "calendar_year", "fy_month_num") := NULL]
+
+# Plot for each fiscal year using your plot_quantiles() function.
+# IMPORTANT: Change the x expression to "Time_of_Day" since Hour and Minute are not available.
+for (yr in unique(quantiles_by_month[[group_by]])) {
+  plot_quantiles(quantiles_by_month[get(group_by) == yr],
+                 title = paste("30-Min Total Consumption Quantiles –", yr),
+                 facet_var = "Month_Label",
+                 x = "Time_of_Day")
+}
+```
+
+### Plot 2: Quantiles of Customer Averages Across Years
+
+```{r}
+avg_by_customer <- dt_ausgrid_customer_long[, .(
+  TC_avg = mean(Total_Consmp, na.rm = TRUE),
+  Net_avg = mean(Net_Consmp, na.rm = TRUE)
+), by = .(Customer, Time_of_Day, Hour, Minute)]
+
+quantiles_by_time <- avg_by_customer[, .(
+  TC_median = quantile(TC_avg, 0.5, na.rm = TRUE),
+  TC_p05 = quantile(TC_avg, 0.05, na.rm = TRUE),
+  TC_p25 = quantile(TC_avg, 0.25, na.rm = TRUE),
+  TC_p75 = quantile(TC_avg, 0.75, na.rm = TRUE),
+  TC_p95 = quantile(TC_avg, 0.95, na.rm = TRUE),
+  Net_median = quantile(Net_avg, 0.5, na.rm = TRUE),
+  Net_p05 = quantile(Net_avg, 0.05, na.rm = TRUE),
+  Net_p25 = quantile(Net_avg, 0.25, na.rm = TRUE),
+  Net_p75 = quantile(Net_avg, 0.75, na.rm = TRUE),
+  Net_p95 = quantile(Net_avg, 0.95, na.rm = TRUE)
+), by = .(Time_of_Day, Hour, Minute)]
+
+# Reshape for plotting
+tc_quantiles <- quantiles_by_time[, .(Time_of_Day, Hour, Minute, median = TC_median, p25 = TC_p25, p75 = TC_p75, p05 = TC_p05, p95 = TC_p95)]
+tc_quantiles[, Consumption_Type := "Total Consumption"]
+net_quantiles <- quantiles_by_time[, .(Time_of_Day, Hour, Minute, median = Net_median, p25 = Net_p25, p75 = Net_p75, p05 = Net_p05, p95 = Net_p95)]
+net_quantiles[, Consumption_Type := "Net Consumption"]
+quantiles_long <- rbind(tc_quantiles, net_quantiles)
+
+plot_quantiles(quantiles_long,
+               title = "30-Min Consumption Quantiles: Total vs Net (All Years, All Customers)",
+               facet_var = "Consumption_Type")
+```
+
+### Plot 3: Box Plot
+
+```{r}
+df_box <- melt(dt_ausgrid_customer_long[, .(Time_of_Day, Hour, Minute, Total_Consmp, Net_Consmp)],
+               id.vars = c("Time_of_Day", "Hour", "Minute"),
+               measure.vars = c("Total_Consmp", "Net_Consmp"),
+               variable.name = "Consumption_Type",
+               value.name = "Value")
+
+# Convert df_box to a data.table (if it's not already)
+setDT(df_box)
+
+# Replace the values in the Consumption_Type column using fifelse()
+df_box[, Consumption_Type := fifelse(Consumption_Type == "Total_Consmp",
+                                      "Total Consumption",
+                                      "Net Consumption")]
+df_box[, Time_num := Hour + Minute / 60]
+
+box_stats <- df_box[, .(
+  min = quantile(Value, 0.05, na.rm = TRUE),
+  lower = quantile(Value, 0.25, na.rm = TRUE),
+  middle = quantile(Value, 0.5, na.rm = TRUE),
+  upper = quantile(Value, 0.75, na.rm = TRUE),
+  max = quantile(Value, 0.95, na.rm = TRUE)
+), by = .(Time_of_Day, Consumption_Type, Time_num)]
+
+p_box <- ggplot(box_stats, aes(x = Time_num)) +
+  geom_boxplot(aes(ymin = min, lower = lower, middle = middle, upper = upper, ymax = max,
+                   fill = Consumption_Type, group = interaction(Time_num, Consumption_Type)),
+               stat = "identity") +
+  facet_wrap(~Consumption_Type, ncol = 2) +
+  scale_x_continuous(breaks = seq(0, 24, by = 2), labels = sprintf("%02d:00", seq(0, 24, by = 2))) +
+  labs(
+    title = "Comparison of Total and Net Consumption by 30-Minute Interval",
+    x = "Hour of Day",
+    y = "Consumption (kWh)",
+    fill = "Consumption Type"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+print(p_box)
+```

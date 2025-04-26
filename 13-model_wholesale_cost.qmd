@@ -1,0 +1,1651 @@
+---
+title: "3. Model wholesale cost for solar vs non-solar customers"
+format: html
+html:
+  code-fold: true
+  code_summary: "Show the code"
+editor: visual
+---
+
+## Initialise
+
+Load required packages
+
+```{r}
+#| message: false
+#| echo: false
+#| results: 'hide'
+#| code-fold: true
+#| code-summary: "Show the code"
+
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(lubridate)
+library(ggplot2)
+library(patchwork)
+library(readr)
+library(reshape2)
+library(gganimate)
+library(magick)
+library(gifski)
+library(imputeTS)
+library(purrr)
+
+```
+
+## Load consumption and solar generation data
+
+Import and clean Ausgrid Consumption Data. Remove 'forced' intervals that don't exist on day of DST in Sydney.
+
+```{r}
+#| message: false
+#| echo: false
+#| code-fold: true
+#| code-summary: "Show the code"
+
+# Define the cache file path
+consmp_cache_file <- "01-ausgrid-solar-customers/dt_ausgrid_long.rds"
+
+if (file.exists(consmp_cache_file)) {
+  cat("Loading cached dt_ausgrid_customer_long...\n")
+  dt_ausgrid_customer_long <- readRDS(consmp_cache_file)
+  cat("Imported cached dt_ausgrid_customer_long.\n")
+} else {
+  cat("Household consumption cache not found. Run script `1. Solar_Load_Profile`\n")
+}
+
+# Remove zero-value entries as proxy for non-existent intervals on DST day 
+dt_ausgrid_customer_long <- dt_ausgrid_customer_long[!(GC == 0 & CL == 0 & GG == 0)]
+
+# Create a new column for the half-hour beginning time by subtracting 30 minutes
+dt_ausgrid_customer_long[, Timestamp_Start := Timestamp - 30*60]
+
+# Force the start timestamp to be interpreted as Australia/Sydney
+dt_ausgrid_customer_long[, Timestamp_Start := force_tz(Timestamp_Start, "Australia/Sydney")]
+
+# Convert the start timestamp to Brisbane time
+dt_ausgrid_customer_long[, Timestamp_Start_Brisbane := with_tz(Timestamp_Start, "Australia/Brisbane")]
+
+cat("Converted to Brisbane time zone for consistency with AEMO wholesale price data.\n")
+
+head(dt_ausgrid_customer_long)
+```
+
+Error check: No duplicates in timestamps for each customer
+
+```{r}
+#| message: false
+#| echo: false
+#| code-fold: true
+#| code-summary: "Show the code"
+
+# Find rows with NA in either Timestamp or Timestamp_Brisbane
+na_rows <- dt_ausgrid_customer_long[is.na(Timestamp_Start) | is.na(Timestamp_Start_Brisbane)]
+cat("Number of rows with NA in Timestamp or Timestamp_Brisbane:", nrow(na_rows), "\n")
+
+# Check duplicates in Brisbane timestamps for each customer
+dup_brisbane <- dt_ausgrid_customer_long[, .N, by = .(Customer, Timestamp_Start_Brisbane)][N > 1]
+print(dup_brisbane)
+
+# Check duplicates in original Sydney timestamps for each customer
+dup_sydney <- dt_ausgrid_customer_long[, .N, by = .(Customer, Timestamp_Start)][N > 1]
+print(dup_sydney)
+```
+
+### Scale solar capacity to average of 6.6kW
+
+Ausgrid customer sample (2010-11 to 2012-13) had an average capacity of 1.68kW. Rescale size, output, and net consumption to reflect current solar household.
+
+```{r}
+#| message: false
+#| echo: false
+#| code-fold: true
+#| code-summary: "Show the code"
+
+# Rescale solar output to a 6.6kW system size
+avg_system_size <- mean(dt_ausgrid_customer_long$Generator_Capacity, na.rm = TRUE)
+target_size <- 6.6
+pv_scale_factor <- target_size / avg_system_size
+
+# Create new datatable for rescaled solar output
+dt_ausgrid_rescaled_solar <- copy(dt_ausgrid_customer_long)
+
+dt_ausgrid_rescaled_solar <- dt_ausgrid_rescaled_solar %>% 
+  mutate(
+    Generator_Capacity = Generator_Capacity * pv_scale_factor,
+    GG = GG * pv_scale_factor, 
+    Net_Consmp = pmax(Total_Consmp - GG, 0),
+  )
+
+# Create a new standardized timestamp by replacing the year with 2020.
+setDT(dt_ausgrid_rescaled_solar)
+dt_ausgrid_rescaled_solar[, Std_Timestamp := update(Timestamp_Start_Brisbane, year = 2020)]
+
+# Compute average consumption and generation across the years
+avg_profiles <- dt_ausgrid_rescaled_solar[, .(
+  avg_GC = mean(GC, na.rm = TRUE),
+  avg_CL = mean(CL, na.rm = TRUE),
+  avg_GG = mean(GG, na.rm = TRUE)
+), by = .(Customer, Std_Timestamp)]
+
+avg_profiles[, avg_Total_Consmp := avg_GC + avg_CL]
+avg_profiles[, avg_Net_Consmp := pmax(avg_Total_Consmp - avg_GG, 0)]
+
+head(avg_profiles)
+```
+
+## Load wholesale prices
+
+Import historical NEM wholesale spot price
+
+```{r}
+#| message: false
+#| echo: false
+#| results: 'hide'
+#| code-fold: true
+#| code-summary: "Show the code"
+
+price_cache_file <- "02-nem-wholesale-price/nem_30min_prices.rds"
+
+dt_wholesale_prices <- readRDS(price_cache_file)
+
+setDT(dt_wholesale_prices)
+
+dt_wholesale_prices <- dt_wholesale_prices[!is.na(Interval_Start)]
+
+# Force the settlement date to Australia/Brisbane
+dt_wholesale_prices[, Settlement_Brisbane := force_tz(Interval_Start, "Australia/Brisbane")]
+
+# Create a Year column in nem_30min based on the original Interval_Start
+dt_wholesale_prices[, Year := year(Interval_Start)]
+
+# Standardise wholesale price data timestamps (2020)
+dt_wholesale_prices[, Std_Timestamp := update(Interval_Start, year = 2020)]
+
+head(dt_wholesale_prices)
+```
+
+# Spot-Only Analysis
+
+```{r}
+#| message: false
+#| echo: false
+#| code-fold: true
+#| code-summary: "Show the code"
+
+# Define FiT rates ($/MWh) for the "With Export" scenario
+FiT_list <- list(
+  NSW1 = 49,    # $/MWh
+  VIC1 = 33,
+  QLD1 = 40,
+  SA1  = 40,
+  TAS1 = 89.35
+)
+
+# Create a caption for FiT rates (in cents/kWh for readability)
+fit_caption <- paste0(
+  "Assumed FiT rate per kWh: ",
+  paste0(sub("1$", "", names(FiT_list)), " ",
+         format(round(unlist(FiT_list) / 10, 1), nsmall = 1), "c",
+         collapse = ", ")
+)
+
+# Define scenarios
+scenarios <- data.table(
+  scenario = c("No Export", "With Export"),
+  use_FiT = c(FALSE, TRUE)
+)
+
+# Initialize a list to store annual results
+annual_results_list <- list()
+
+# Loop over regions
+for (r in unique(dt_wholesale_prices$REGION)) {
+  dt_region_wholesale <- dt_wholesale_prices[REGION == r, .(Std_Timestamp, RRP_weighted, Year)]
+  
+  # Loop over years
+  for (yr in unique(dt_region_wholesale$Year)) {
+    dt_region_year <- dt_region_wholesale[Year == yr]
+    
+    # Merge once per region-year
+    merged_dt <- merge(
+      avg_profiles,
+      dt_region_year,
+      by = "Std_Timestamp",
+      all.x = TRUE,
+      allow.cartesian = TRUE
+    )
+    
+    # Check for unmatched intervals
+    if (yr %% 4 != 0 || (yr %% 100 == 0 && yr %% 400 != 0)) {
+      feb29_pattern <- "^[0-9]{4}-02-29"
+      expected_unmatched <- merged_dt[grepl(feb29_pattern, Std_Timestamp) & is.na(RRP_weighted), .N]
+      actual_unmatched <- merged_dt[is.na(RRP_weighted), .N] - expected_unmatched
+    } else {
+      actual_unmatched <- merged_dt[is.na(RRP_weighted), .N]
+    }
+    
+    if (actual_unmatched > 0) {
+      warning(sprintf("For region %s, year %s: %d actual unmatched intervals\n",
+                      r, yr, actual_unmatched))
+    }
+    
+    if (nrow(merged_dt) == 0) next
+    
+    # Compute common variables once
+    merged_dt[, `:=`(
+      wholesale_cost_TC = (avg_Total_Consmp / 1000) * RRP_weighted,
+      energy_TC = avg_Total_Consmp / 1000,
+      energy_Net = avg_Net_Consmp / 1000
+    )]
+    
+    # Optionally compute avg_Export always (or conditionally if use_FiT is TRUE)
+    merged_dt[, avg_Export := pmax(avg_GG - avg_Total_Consmp, 0)]
+    
+    # Loop over scenarios
+    for (s in 1:nrow(scenarios)) {
+      current_scenario <- scenarios[s, scenario]
+      use_FiT <- scenarios[s, use_FiT]
+      
+      # Compute scenario-specific wholesale_cost_Net
+      if (use_FiT) {
+        merged_dt[, wholesale_cost_Net := (avg_Net_Consmp / 1000) * RRP_weighted -
+                    (avg_Export / 1000) * (RRP_weighted - FiT_list[[r]])]
+      } else {
+        merged_dt[, wholesale_cost_Net := (avg_Net_Consmp / 1000) * RRP_weighted]
+      }
+      
+      # Aggregate to annual totals
+      annual <- merged_dt[, .(
+        total_wholesale_cost_TC = sum(wholesale_cost_TC, na.rm = TRUE),
+        total_wholesale_cost_Net = sum(wholesale_cost_Net, na.rm = TRUE),
+        total_energy_TC = sum(energy_TC, na.rm = TRUE),
+        total_energy_Net = sum(energy_Net, na.rm = TRUE)
+      )]
+      
+      # Compute unit costs ($/MWh)
+      annual[, `:=`(
+        Unit_Cost_TC = total_wholesale_cost_TC / total_energy_TC,
+        Unit_Cost_Net = total_wholesale_cost_Net / total_energy_Net
+      )]
+      
+      # Add identifiers
+      annual[, `:=`(REGION = r, Year = yr, scenario = current_scenario)]
+      
+      # Store results
+      annual_results_list[[paste(current_scenario, r, yr, sep = "_")]] <- annual
+    }
+    
+    # Clean up
+    rm(merged_dt)
+    gc(verbose = FALSE)
+  }
+}
+
+# Combine results
+annual_results <- rbindlist(annual_results_list)
+
+head(annual_results)
+```
+
+Prepare data for plotting
+
+```{r}
+#| message: false
+#| echo: false
+#| results: 'hide'
+#| code-fold: true
+#| code-summary: "Show the code"
+
+# Calculate differences
+annual_results[, `:=`(
+  Nominal_Diff = Unit_Cost_TC - Unit_Cost_Net,
+  Percent_Diff = ((Unit_Cost_TC - Unit_Cost_Net) / Unit_Cost_TC) * 100
+)]
+
+# Unit cost data
+plot_data <- melt(
+  annual_results,
+  id.vars = c("REGION", "Year", "scenario"),
+  measure.vars = c("Unit_Cost_TC", "Unit_Cost_Net"),
+  variable.name = "Type",
+  value.name = "UnitCost"
+)
+setDT(plot_data)
+plot_data[, Type := factor(Type, levels = c("Unit_Cost_TC", "Unit_Cost_Net"),
+                           labels = c("Non-Solar (Total)", "Solar (Net)"))]
+
+# Difference data
+df_diff_long <- melt(
+  annual_results,
+  id.vars = c("REGION", "Year", "scenario"),
+  measure.vars = c("Nominal_Diff", "Percent_Diff"),
+  variable.name = "Difference_Type",
+  value.name = "Difference"
+)
+setDT(df_diff_long)
+```
+
+Define plotting function
+
+```{r}
+#| message: false
+#| echo: false
+#| results: 'hide'
+#| code-fold: true
+#| code-summary: "Show the code"
+
+# Define plotting functions
+
+create_unit_cost_plot <- function(data, scenario_name, caption_text) {
+  ggplot(data, aes(x = Year, y = UnitCost, color = Type)) +
+    geom_line(size = 1) +
+    geom_point(size = 2) +
+    facet_wrap(~ REGION, scales = "free_y", ncol = 2) +
+    scale_color_manual(values = c("Non-Solar (Total)" = "blue", "Solar (Net)" = "orange")) +
+    scale_x_continuous(
+      breaks = unique(data$Year),
+      labels = function(x) substr(as.character(x), 3, 4)
+    ) +
+    labs(
+      title = paste("Average Wholesale Unit Cost: Non-Solar vs Solar by Region (", scenario_name, ")", sep = ""),
+      x = "Year",
+      y = "Unit Cost ($/MWh)",
+      color = "Consumption Type",
+      caption = caption_text
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 0, hjust = 0.5),
+      strip.text = element_text(size = 10, face = "bold"),
+      panel.grid.minor.x = element_blank()
+    )
+}
+
+create_diff_plot <- function(data, scenario_name, caption_text) {
+  ggplot(data, aes(x = Year, y = Difference, color = Difference_Type)) +
+    geom_line(size = 1) +
+    geom_point(size = 2) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    facet_grid(Difference_Type ~ REGION, scales = "free_y",
+               labeller = labeller(Difference_Type = c("Nominal_Diff" = "Nominal Difference ($/MWh)",
+                                                       "Percent_Diff" = "Percentage Difference (%)"))) +
+    scale_color_manual(values = c("Nominal_Diff" = "purple", "Percent_Diff" = "purple4")) +
+    scale_x_continuous(
+      breaks = seq(min(data$Year), max(data$Year), by = 2),
+      labels = function(x) substr(as.character(x), 3, 4)
+    ) +
+    labs(
+      title = paste("Unit Cost Differences: Non-Solar vs Solar by Region (", scenario_name, ")", sep = ""),
+      x = "Year",
+      y = NULL,
+      caption = caption_text
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "none",
+      axis.text.x = element_text(angle = 0, hjust = 0.5),
+      strip.text = element_text(size = 10, face = "bold"),
+      panel.grid.minor.x = element_blank()
+    )
+}
+
+```
+
+Generate plots
+
+```{r}
+#| message: false
+#| echo: false
+#| results: 'hide'
+#| code-fold: true
+#| code-summary: "Show the code"
+
+# Remove Year 2025
+plot_data_rm25 <- plot_data[Year != 2025]
+df_diff_long_rm25 <- df_diff_long[Year != 2025]
+
+# 1. No Export - Wholesale Unit Cost
+p_unit_cost_no_export <- create_unit_cost_plot(
+  plot_data_rm25[scenario == "No Export"],
+  "No Export",
+  "Solar export not considered."
+)
+
+# 2. No Export - Nominal and Percentage Differences
+p_diff_no_export <- create_diff_plot(
+  df_diff_long_rm25[scenario == "No Export"],
+  "No Export",
+  "Solar export not considered."
+)
+
+# 3. With Export - Wholesale Unit Cost
+p_unit_cost_with_export <- create_unit_cost_plot(
+  plot_data_rm25[scenario == "With Export"],
+  "With Export",
+  fit_caption
+)
+
+# 4. With Export - Nominal and Percentage Differences
+p_diff_with_export <- create_diff_plot(
+  df_diff_long_rm25[scenario == "With Export"],
+  "With Export",
+  fit_caption
+)
+
+# Display the plots
+print(p_unit_cost_no_export)
+print(p_diff_no_export)
+print(p_unit_cost_with_export)
+print(p_diff_with_export)
+
+# Optional: Save the plots to files
+# ggsave("unit_cost_no_export.png", p_unit_cost_no_export, width = 12, height = 8)
+# ggsave("diff_no_export.png", p_diff_no_export, width = 12, height = 8)
+# ggsave("unit_cost_with_export.png", p_unit_cost_with_export, width = 12, height = 8)
+# ggsave("diff_with_export.png", p_diff_with_export, width = 12, height = 8)
+```
+
+# Hedging Model
+
+### Prepare data
+
+Load base swaps and cap data
+
+```{r}
+
+dl_folder <- "/Users/m09w/Downloads"
+
+# Quarterly cap contract
+# Helper function to convert currency strings to numeric values.
+convert_currency <- function(x) {
+  # Remove leading/trailing whitespace.
+  x <- str_trim(x)
+  # Treat dashes or empty strings as NA.
+  x[x %in% c("-", "")] <- NA
+  # If the value is in parentheses, remove them and add a negative sign.
+  # e.g. "($1.00)" becomes "-1.00"
+  x <- ifelse(str_detect(x, "^\\(.*\\)$"),
+              paste0("-", str_replace_all(x, "[\\(\\)$]", "")),
+              x)
+  # Remove any dollar signs or commas.
+  x <- str_replace_all(x, "[$,]", "")
+  as.numeric(x)
+}
+
+# Read the CSV with 'Week Close' and 'Net Change' as character
+df_cap_qtr <- read_csv(
+  paste0(dl_folder, "/cap_prices.csv"),
+  col_types = cols(
+    Contract        = col_character(),
+    `Week Close`    = col_character(),  # read as character
+    `Net Change`    = col_character(),  # read as character
+    `Traded Volume` = col_double(),
+    `Open Interest` = col_double(),
+    date            = col_date(format = "%d/%m/%Y")
+  )
+)
+
+# Use the helper function to convert the currency strings
+df_cap_qtr <- df_cap_qtr %>%
+  mutate(
+    `Week Close` = convert_currency(`Week Close`),
+    `Net Change` = convert_currency(`Net Change`)
+  )
+
+# Quaterly base contract
+# 17 quarters ahead
+df_base_qtr <- read_csv(
+  paste0(dl_folder, "/forward_price_curves.csv"),
+  col_types = cols(
+    code    = col_character(),
+    settle  = col_double(),
+    state   = col_character(),
+    quarter = col_character(),
+    expiry  = col_date(format = "%d/%m/%Y"),
+    date    = col_date(format = "%d/%m/%Y")
+  )
+)
+df_base_qtr <- distinct(df_base_qtr)
+
+# Cap strike price (in $/MWh)
+cap_strike_price <- 300
+```
+
+Define simulation period
+
+```{r}
+# Simulation period (actual dates for spot prices and hedging pricing)
+sim_start <- ymd("2024-09-27", tz = "Australia/Brisbane")
+sim_end   <- ymd("2025-04-16", tz = "Australia/Brisbane")
+```
+
+Prepare consumption data and retailer load
+
+```{r}
+
+# Create a customer_load dataframe that includes recalculates gross and net consumption
+customer_load <- avg_profiles %>% 
+  mutate(
+    avg_Total_Consmp = avg_GC + avg_CL,
+    avg_Net_Consmp   = avg_Total_Consmp - avg_GG,
+    # Define net_export as the positive value of export (if net consumption is negative)
+    net_export = if_else(avg_Net_Consmp < 0, -avg_Net_Consmp, 0),
+    merge_key = format(Std_Timestamp, "%m-%d %H:%M")
+  )
+# For retailer-level aggregation, assume the retailer supplies 300 customers.
+# (If avg_profiles is per customer, then the aggregated load is simply the sum over Customer.)
+# At the retailer level (300 customers) simply sum consumption by merge_key.
+retailer_load <- customer_load %>% 
+  group_by(merge_key) %>% 
+  summarise(
+    Std_Timestamp = first(Std_Timestamp),
+    agg_Total = sum(avg_Total_Consmp, na.rm = TRUE),
+    agg_Net   = sum(avg_Net_Consmp, na.rm = TRUE),
+    agg_Export = sum(net_export, na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    demand_MW = agg_Total * 2 / 1000,
+    demand_solar_MW = agg_Net * 2 / 1000
+  )
+
+# Compute annual peak demand
+annual_peak <- retailer_load %>% 
+  summarise(
+    Std_Timestamp = first(Std_Timestamp),
+    peak_non_solar = max(demand_MW, na.rm=TRUE),
+    peak_solar     = max(demand_solar_MW, na.rm=TRUE)
+  )
+```
+
+Prepare Simulation Spot Price Data
+
+```{r}
+
+dt_simulation_prices <- dt_wholesale_prices %>%
+  filter(Interval_Start >= sim_start, Interval_Start <= sim_end) %>%
+  mutate(Interval = Interval_Start)
+
+# Create merge_key from Interval (using mm-dd HH:MM) to join with customer load
+dt_simulation_prices <- dt_simulation_prices %>%
+  mutate(merge_key = format(Interval, "%m-%d %H:%M"))
+```
+
+### Compute Hedge Volumes from Consumption Data
+
+Define quarter consumption windows (dates in 2020)
+
+```{r}
+# Define quarter windows, start and end consumption period
+q_windows <- tibble(
+  Quarter = c("Q3_2024","Q4_2024", "Q1_2025", "Q2_2025"),
+  start_cons = as.POSIXct(c("2020-07-01 00:00:00", "2020-10-01 00:00:00", "2020-01-01 00:00:00", "2020-04-01 00:00:00"), tz = "Australia/Brisbane"),
+  end_cons   = as.POSIXct(c("2020-09-30 23:30:00", "2020-12-31 23:30:00", "2020-03-31 23:30:00", "2020-06-30 23:30:00"), tz = "Australia/Brisbane")
+)
+```
+
+Compute quarter by quarter base and cap volume
+
+```{r}
+
+base_cap_volume <- q_windows %>% rowwise() %>% 
+  mutate(
+    base_non_solar = {
+      d <- retailer_load %>% 
+        filter(Std_Timestamp >= start_cons,
+               Std_Timestamp <= end_cons) %>% 
+        pull(demand_MW)
+      min(d, na.rm = TRUE)
+    },
+    base_solar = {
+      d <- retailer_load %>% 
+        filter(Std_Timestamp >= start_cons,
+               Std_Timestamp <= end_cons) %>% 
+        pull(demand_solar_MW)
+      pmax(min(d, na.rm = TRUE), 0)
+    }, 
+    cap_non_solar = pmax(annual_peak$peak_non_solar - base_non_solar, 0),
+    cap_solar = pmax(annual_peak$peak_solar - base_solar, 0)
+  ) %>% 
+  ungroup()
+
+print(base_cap_volume)
+```
+
+### Determine Hedge Prices for Each Quarter and State
+
+```{r}
+# Define a function to return the hedge window for a given quarter.
+# Parameter: hedge_window_length (default 91 days) except for Q4_2024.
+get_hedge_window <- function(qtr, q_start_new, hedge_window_length = 91) {
+  if(qtr == "Q4_2024") {
+    return(c(ymd("2024-09-27", tz = "Australia/Brisbane"), ymd("2024-09-27", tz = "Australia/Brisbane")))
+  } else {
+    return(c(q_start_new - days(hedge_window_length), q_start_new - days(1)))
+  }
+}
+
+# Cut off dates for hedging before new quarter
+q_start_dates <- tibble(
+  Quarter = c("Q4_2024", "Q1_2025", "Q2_2025"),
+  start_new = as.Date(c("2024-10-01", "2025-01-01", "2025-04-01"))
+)
+
+hedge_price_list <- list()
+for (st in c("NSW", "VIC", "QLD", "SA")) {
+  for (i in 1:nrow(q_start_dates)) {
+    qtr <- q_start_dates$Quarter[i]
+    win <- get_hedge_window(qtr, q_start_dates$start_new[i])
+    # Base swap price from df_base_qtr.
+    df_base_sub <- df_base_qtr %>% 
+      filter(state == st, str_detect(quarter, str_sub(qtr, 1, 2)))
+    swap_price <- df_base_sub %>% 
+      filter(date >= win[1], date <= win[2], wday(date) == 6) %>% 
+      summarise(avg_swap = mean(settle, na.rm = TRUE)) %>% 
+      pull(avg_swap)
+    
+    # Cap premium from df_cap_qtr.
+    df_cap_sub <- df_cap_qtr %>% 
+      filter(str_detect(Contract, paste0(st, " Caps")))
+    cap_prem <- df_cap_sub %>% 
+      filter(date >= win[1], date <= win[2], wday(date) == 6) %>% 
+      summarise(avg_cap = mean(`Week Close`, na.rm = TRUE)) %>% 
+      pull(avg_cap)
+    
+    hedge_price_list[[paste(st, qtr, sep = "_")]] <- tibble(
+      State = st,
+      Quarter = qtr,
+      SwapPrice = swap_price,     # (initially in cents per MWh)
+      CapPremium = cap_prem
+    )
+  }
+}
+
+df_hedge_prices <- bind_rows(hedge_price_list) %>%
+  mutate(
+    # Convert SwapPrice from cents per MWh to dollars per MWh.
+    SwapPrice = SwapPrice / 100
+  )
+```
+
+### Simulation: Compute Half-Hourly Wholesale Costs
+
+Join the simulation spot price data with retailer load.
+
+```{r}
+
+sim_data <- dt_simulation_prices %>%
+  left_join(retailer_load, by = "merge_key") %>%
+  mutate(
+    sim_date = as.Date(Interval, tz = "Australia/Brisbane"),
+    Quarter = case_when(
+      sim_date >= as.Date("2024-07-01") & sim_date <= as.Date("2024-09-30") ~ "Q3_2024",
+      sim_date >= as.Date("2024-10-01") & sim_date <= as.Date("2024-12-31") ~ "Q4_2024",
+      sim_date >= as.Date("2025-01-01") & sim_date <= as.Date("2025-03-31") ~ "Q1_2025",
+      sim_date >= as.Date("2025-04-01") & sim_date <= as.Date("2025-06-30") ~ "Q2_2025",
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+Define total wholesale cost as a function
+
+```{r}
+# Note: if the interval is within the unhedged period (27 Sept 2024 to 30 Sept 2024), 
+# we set hedging volumes to 0.
+calc_wholesale_cost <- function(Load_kWh, SpotPrice, baseVol, capVol, swapPrice, capPrem, FiT_rate, sim_date) {
+  if (any(is.na(c(Load_kWh, SpotPrice, baseVol, capVol, swapPrice, capPrem, sim_date))))
+    return(NA_real_)
+  energy_MWh <- Load_kWh / 1000
+  if (sim_date >= as.Date("2024-09-27") && sim_date <= as.Date("2024-09-30"))
+    return(energy_MWh * SpotPrice)
+  cost_spot <- energy_MWh * SpotPrice
+  cost_swap <- (baseVol * 0.5) * (SpotPrice - swapPrice)
+  cost_cap  <- (capVol  * 0.5) * pmax(0, SpotPrice - cap_strike_price)
+  cost_cap_prem <- (capVol * 0.5) * capPrem
+  # FiT cost calcualted outside of this function.
+  total_cost <- cost_spot - cost_swap - cost_cap + cost_cap_prem
+  return(total_cost)
+}
+```
+
+For each state and for each retailer type (non_solar vs solar), calculate costs
+
+```{r}
+
+# Define FiT rate
+FiT_list <- list(
+  NSW = 49,    # $/MWh
+  VIC = 33,
+  QLD = 40,
+  SA  = 40,
+  TAS = 89.35
+)
+
+# Join base/cap table with sim_data
+sim_data <- sim_data %>%
+  left_join(
+    base_cap_volume %>%
+      select(Quarter,
+             base_non_solar, base_solar,
+             cap_non_solar,  cap_solar),
+    by = "Quarter"
+  )
+
+results_list     <- list()
+breakdown_list   <- list()
+sim_data3_list   <- list()
+
+for (st in c("NSW", "VIC", "QLD", "SA")) {
+
+  # 1) Filter to this state
+  df_state <- sim_data %>% filter(REGION == paste0(st, "1"))
+  FiT_rate  <- FiT_list[[st]]
+
+  for (type in c("non_solar", "solar")) {
+
+    # pick which load column we’re using
+    load_col     <- if (type == "non_solar") "agg_Total" else "agg_Net"
+    sim_data_iter <- df_state %>% filter(!is.na(Quarter))
+
+    # 2) Progressive book‑building prices
+    sim_data_iter <- sim_data_iter %>%
+      rowwise() %>%
+      mutate(
+        SwapPrice  = mean(
+          df_hedge_prices %>% filter(State==st, Quarter==Quarter) %>% pull(SwapPrice),
+          na.rm = TRUE
+        ),
+        CapPremium = mean(
+          df_hedge_prices %>% filter(State==st, Quarter==Quarter) %>% pull(CapPremium),
+          na.rm = TRUE
+        )
+      ) %>%
+      ungroup()
+
+    # 3) Pick the base and cap volumes that you pre‑computed
+    sim_data_iter <- sim_data_iter %>%
+      mutate(
+        baseVol  = if (type=="non_solar") base_non_solar else base_solar,
+        capVol   = if (type=="non_solar") cap_non_solar  else cap_solar,
+        sim_date = as.Date(Interval_Start, tz="Australia/Brisbane"),
+        # zero out in the opening “unhedged” window
+        baseVol  = if_else(sim_date < as.Date("2024-10-01"), 0, baseVol),
+        capVol   = if_else(sim_date < as.Date("2024-10-01"), 0, capVol)
+      )
+
+    # 4) Compute the half‑hourly wholesale cost
+    sim_data_iter <- sim_data_iter %>%
+      mutate(
+        WholesaleCost = pmap_dbl(
+          list(
+            Load_kWh  = .data[[load_col]],
+            SpotPrice = RRP_weighted,
+            baseVol   = baseVol,
+            capVol    = capVol,
+            swapPrice = SwapPrice,
+            capPrem   = CapPremium,
+            sim_date  = sim_date      # ← **now named**, so calc_wholesale_cost gets it**
+          ),
+          function(Load_kWh, SpotPrice, baseVol, capVol, swapPrice, capPrem, sim_date) {
+            # guard against any missing inputs
+            if (any(is.na(c(Load_kWh, SpotPrice, baseVol, capVol, swapPrice, capPrem, sim_date)))) {
+              return(NA_real_)
+            }
+            # pass FiT_rate along explicitly
+            calc_wholesale_cost(
+              Load_kWh, SpotPrice,
+              baseVol,  capVol,
+              swapPrice, capPrem,
+              FiT_rate, sim_date
+            )
+          }
+        )
+      )
+
+    # 5) Decompose into line items
+    sim_data_iter <- sim_data_iter %>%
+      mutate(
+        energy_MWh         = .data[[load_col]] / 1000,
+        cost_spot          = energy_MWh * RRP_weighted,
+        cost_swap          = (baseVol * 0.5) * (RRP_weighted - SwapPrice),
+        cost_cap           = (capVol  * 0.5) * pmax(0, RRP_weighted - cap_strike_price),
+        cost_cap_prem      = (capVol  * 0.5) * CapPremium,
+        cost_FiT           = if (type=="solar") (agg_Export / 1000) * FiT_rate else 0,
+        WholesaleCost_calc = cost_spot - cost_swap - cost_cap + cost_cap_prem + cost_FiT,
+        State              = st,
+        Retailer           = type
+      )
+
+    # save the detailed 30‑min data
+    sim_data3_list[[paste(st, type, sep = "_")]] <- sim_data_iter
+
+    # 6) Summarise overall results
+    total_energy <- if (type=="non_solar") {
+      sum(sim_data_iter[[load_col]][sim_data_iter[[load_col]] > 0], na.rm=TRUE)/1000
+    } else {
+      sum(pmax(sim_data_iter[[load_col]], 0), na.rm=TRUE)/1000
+    }
+    total_cost <- sum(sim_data_iter$WholesaleCost, na.rm=TRUE)
+    unit_cost  <- total_cost / total_energy
+
+    results_list[[paste(st, type, sep = "_")]] <- tibble(
+      State       = st,
+      Retailer    = type,
+      TotalCost   = total_cost,
+      TotalEnergy = total_energy,
+      UnitCost    = unit_cost
+    )
+
+    # 7) Quarter‑by‑quarter breakdown
+    breakdown_list[[paste(st, type, sep = "_")]] <- sim_data_iter %>%
+      group_by(State, Retailer, Quarter) %>%
+      summarise(
+        total_spot           = sum(cost_spot, na.rm=TRUE),
+        total_swap           = sum(cost_swap, na.rm=TRUE),
+        total_cap            = sum(cost_cap, na.rm=TRUE),
+        total_cap_prem       = sum(cost_cap_prem, na.rm=TRUE),
+        total_FiT            = sum(cost_FiT, na.rm=TRUE),
+        total_WholesaleCost  = sum(WholesaleCost_calc, na.rm=TRUE),
+        total_energy         = sum(energy_MWh, na.rm=TRUE),
+        avg_spot_price       = mean(RRP_weighted, na.rm=TRUE),
+        effective_swap_price = mean(SwapPrice, na.rm=TRUE),
+        effective_cap_premium= mean(CapPremium, na.rm=TRUE),
+        base_swap_volume     = mean(baseVol, na.rm=TRUE),
+        cap_volume           = mean(capVol, na.rm=TRUE),
+        aggregate_total_consumption = sum(agg_Total, na.rm=TRUE),
+        aggregate_net_consumption   = sum(agg_Net, na.rm=TRUE),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        UC_spot     = total_spot  / total_energy,
+        UC_swap     = total_swap  / total_energy,
+        UC_cap      = total_cap   / total_energy,
+        UC_cap_prem = total_cap_prem / total_energy,
+        UC_FiT      = total_FiT   / total_energy,
+        UC_total    = total_WholesaleCost / total_energy
+      )
+
+  }  # end retailer loop
+}    # end state loop
+
+# Final combine
+df_results   <- bind_rows(results_list)
+df_breakdown <- bind_rows(breakdown_list)
+sim_data3    <- bind_rows(sim_data3_list)
+```
+
+### Plotting
+
+Prepare data for plotting differences
+
+```{r}
+# Pivot the results so that for each state we have unit costs for non-solar and solar.
+df_wide <- df_results %>% 
+  select(State, Retailer, UnitCost) %>% 
+  pivot_wider(names_from = Retailer, values_from = UnitCost) %>% 
+  mutate(
+    NominalDiff = non_solar - solar,
+    PercentDiff = 100 * (non_solar - solar) / non_solar
+  )
+```
+
+#### Unit Wholesale Cost Comparison
+
+```{r}
+
+date_range <- range(sim_data3$Interval_Start)
+start_date <- as.Date(date_range[1])
+end_date <- as.Date(date_range[2])
+start_date_str <- sub("^0", "", format(start_date, "%d %b %Y"))
+end_date_str   <- sub("^0", "", format(end_date, "%d %b %Y"))
+subtitle_text <- paste(start_date_str, "to", end_date_str)
+
+
+# Plot unit wholesale cost by state and retailer type.
+p_unit_cost <- ggplot(df_results, aes(x = State, y = UnitCost, fill = Retailer)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("non_solar" = "blue", "solar" = "orange")) +
+  labs(
+    title = "Unit Wholesale Cost by State and Retailer (300 customers)",
+    subtitle = subtitle_text,
+    y = "Unit Cost ($/MWh)",
+    x = "State",
+    fill = "Customer Type"
+  ) +
+  theme_minimal()
+
+p_diff_nominal <- ggplot(df_wide, aes(x = State, y = NominalDiff)) +
+  geom_col(fill = "purple") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Nominal Difference (Non-Solar minus Solar)",
+    y = "Difference ($/MWh)",
+    x = "State"
+  ) +
+  theme_minimal()
+
+p_diff_percent <- ggplot(df_wide, aes(x = State, y = PercentDiff)) +
+  geom_col(fill = "purple4") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Percentage Difference: (Non-Solar - Solar)/Non-Solar",
+    y = "Percentage Difference (%)",
+    x = "State"
+  ) +
+  theme_minimal()
+
+print(p_unit_cost)
+print(p_diff_nominal)
+print(p_diff_percent)
+```
+
+#### Compare Hedged vs. No Hedge Cost
+
+```{r}
+cost_comp <- sim_data3 %>%
+  group_by(State, Retailer) %>%
+  summarise(
+    total_energy = if (first(Retailer) == "solar") {
+                      sum(pmax(energy_MWh, 0), na.rm = TRUE)
+                    } else {
+                      sum(energy_MWh[energy_MWh > 0], na.rm = TRUE)
+                    },
+    cost_spot_only = sum(cost_spot, na.rm = TRUE),
+    cost_hedged = sum(WholesaleCost_calc, na.rm = TRUE),
+    unit_cost_spot = cost_spot_only / total_energy,
+    unit_cost_hedged = cost_hedged / total_energy,
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = c(unit_cost_spot, unit_cost_hedged),
+    names_to = "Scenario",
+    values_to = "UnitCost"
+  ) %>%
+  mutate(
+    Scenario = recode(Scenario,
+                      "unit_cost_spot" = "Spot-Only (No Hedge)",
+                      "unit_cost_hedged" = "Hedged")
+  )
+
+# Optionally, you could also compute the difference between spot-only and hedged unit costs:
+cost_comp_diff <- cost_comp %>%
+  pivot_wider(names_from = Scenario, values_from = UnitCost) %>%
+  mutate(
+    Diff = `Spot-Only (No Hedge)` - Hedged,
+    PercentDiff = 100 * Diff / (`Spot-Only (No Hedge)`)
+  )
+
+# -------------------------------
+# Plotting the Comparison
+# -------------------------------
+
+# Plot unit cost comparison for each state and retailer type.
+p_comparison <- ggplot(cost_comp, aes(x = State, y = UnitCost, fill = Scenario)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8)) +
+  facet_wrap(~ Retailer, ncol = 2) +
+  scale_fill_manual(values = c("Spot-Only (No Hedge)" = "firebrick", "Hedged" = "darkgreen")) +
+  labs(
+    title = "Comparison of Unit Wholesale Cost: Hedged vs. Spot-Only",
+    y = "Unit Cost ($/MWh)",
+    x = "State",
+    fill = "Scenario"
+  ) +
+  theme_minimal()
+
+print(p_comparison)
+
+# Optionally, if you wish to plot the difference (absolute or percentage),
+# for example by state and retailer, you can use cost_comp_diff.
+p_diff <- ggplot(cost_comp_diff, aes(x = State, y = Diff)) +
+  geom_col(fill = "purple") +
+  facet_wrap(~ Retailer, ncol = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Absolute Difference in Unit Cost (Spot-Only - Hedged)",
+    y = "Difference ($/MWh)",
+    x = "State"
+  ) +
+  theme_minimal()
+
+print(p_diff)
+```
+
+#### Spot vs Base prices
+
+```{r}
+#### 1. Compute Weighted Prices for Spot and Swap ####
+
+# For each row, we want the weight for the spot price calculation:
+# - For non_solar: weight = agg_Total,
+# - For solar: weight = pmax(agg_Net, 0).
+# (agg_Total, agg_Net are brought in from the retailer load join.)
+
+state_price <- sim_data3 %>%
+  mutate(
+    weight = if_else(Retailer == "non_solar", agg_Total, pmax(agg_Net, 0))
+  ) %>%
+  group_by(State, Retailer) %>%
+  summarise(
+    weighted_spot = sum(RRP_weighted * weight, na.rm = TRUE) / sum(weight, na.rm = TRUE),
+    weighted_swap = sum(SwapPrice * weight, na.rm = TRUE) / sum(weight, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+#### 2. Compute Weighted Cap Premium by Quarter and Then by State ####
+
+# First, aggregate cap premium at the quarter level. Here we weight by number of days in the quarter.
+quarter_cap <- sim_data3 %>%
+  group_by(State, Retailer, Quarter) %>%
+  summarise(
+    cap_prem = mean(CapPremium, na.rm = TRUE),
+    days = n_distinct(sim_date),
+    .groups = "drop"
+  )
+
+state_cap <- quarter_cap %>%
+  group_by(State, Retailer) %>%
+  summarise(
+    weighted_cap = sum(cap_prem * days, na.rm = TRUE) / sum(days, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+#### 3. Combine the State-Level Price Summaries ####
+
+state_prices <- state_price %>%
+  left_join(state_cap, by = c("State", "Retailer"))
+
+#### 4. Pivot to Long Format for Plotting ####
+
+state_prices_long <- state_prices %>%
+  pivot_longer(
+    cols = c(weighted_spot, weighted_swap),
+    names_to = "PriceType",
+    values_to = "Price"
+  ) %>%
+  mutate(
+    PriceType = recode(PriceType,
+                       "weighted_spot" = "Spot Price",
+                       "weighted_swap" = "Swap Price")
+  )
+
+#### 5. Plot: Bars for Spot & Swap, Dots for Cap Premium (Secondary Axis) ####
+
+p_prices <- ggplot(state_prices_long, aes(x = factor(State), y = Price, fill = PriceType)) +
+  geom_bar(stat = "identity",
+           position = position_dodge2(width = 0.9, padding = 0.1),
+           width = 0.4) +
+  geom_point(
+    data = state_prices,
+    aes(x = factor(State), y = weighted_cap, color = "Cap Premium"),
+    inherit.aes = FALSE,
+    shape = 16,
+    size = 3,
+    position = position_dodge2(width = 0.9, padding = 0.1)
+  ) +
+  scale_fill_manual(values = c("Spot Price" = "blue", "Swap Price" = "orange"), name = NULL) +
+  scale_color_manual(name = NULL, values = c("Cap Premium" = "black")) +
+  scale_y_continuous(name = "Price ($/MWh)") +
+  facet_wrap(~ Retailer, ncol = 2) +
+  # Provide a custom name to x-axis:
+  scale_x_discrete(name = NULL, expand = c(0, 0)) +
+  labs(
+    title = "Average Spot and Swap Prices and Cap Premium",
+    subtitle = "Weighted by days in quarter",
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    panel.spacing.x = unit(0.3, "lines")
+  )
+
+print(p_prices)
+```
+
+#### Breakdown energy volume by hedge and spot
+
+```{r}
+
+# First, create the breakdown for each interval.
+load_breakdown <- sim_data3 %>%
+  mutate(
+    # Effective load: for solar, take only the positive part (procurable energy),
+    # for non-solar, use the total energy_MWh as is.
+    effective_load = if_else(Retailer == "solar", pmax(energy_MWh, 0), energy_MWh),
+    # Convert base and cap volumes (in MW) to energy (MWh) for each 30-min interval.
+    base_energy = baseVol * 0.5,
+    cap_energy  = capVol * 0.5,
+    # Compute unhedged energy. If the hedged energy exceeds the effective load, we clip unhedged to zero.
+    unhedged = pmax(effective_load - (base_energy + cap_energy), 0)
+  ) %>%
+  group_by(State, Retailer) %>%
+  summarise(
+    total_base = sum(base_energy, na.rm = TRUE),
+    total_cap = sum(cap_energy, na.rm = TRUE),
+    total_unhedged = sum(unhedged, na.rm = TRUE),
+    total_effective = sum(effective_load, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # It can sometimes be instructive to also have total effective load, but here we focus on the components.
+  pivot_longer(
+    cols = c(total_base, total_cap, total_unhedged),
+    names_to = "HedgeType",
+    values_to = "Volume_MWh"
+  ) %>%
+  mutate(
+    HedgeType = recode(HedgeType,
+                       "total_base" = "Base",
+                       "total_cap" = "Cap",
+                       "total_unhedged" = "Unhedged")
+  ) %>%
+  # Create a variable to combine state and retailer for clustering:
+  mutate(State_Retailer = paste(State, Retailer, sep = "-"))
+
+# Next, create the clustered stacked column plot.
+# We want columns clustered by State with two bars per state (one for solar, one for non_solar)
+# and within each bar the three components are stacked.
+
+p_clustered <- ggplot(load_breakdown, aes(x = State_Retailer, y = Volume_MWh, fill = HedgeType)) +
+  geom_bar(stat = "identity", position = "stack") +
+  # To display only the state abbreviation along x-axis, extract the part before "-"
+  scale_x_discrete(labels = function(x) sapply(strsplit(x, "-"), `[`, 1)) +
+  labs(
+    title = "Load Hedging Breakdown by State and Retailer",
+    subtitle = "Stacked columns show total Base, Cap, and Unhedged energy (MWh) over the simulation period",
+    x = "State",
+    y = "Volume (MWh)",
+    fill = "Hedge Type"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom"
+  )
+
+print(p_clustered)
+
+```
+
+#### Hedged consumption volume
+
+```{r}
+
+# ------------------------------------------------------------------------------
+# 1. Aggregate the 30-minute data by State, Retailer, and Quarter.
+# ------------------------------------------------------------------------------
+# Here we assume sim_data3 (your detailed 30-minute data) has, at minimum:
+#   - State, Retailer ("solar" or "non_solar"), Quarter,
+#   - agg_Total (kWh) and agg_Net (kWh) from the retailer load,
+#   - baseVol (MW) and capVol (MW) per interval,
+#   - Each interval represents 30 minutes (so conversion factor = 0.5).
+# For load:
+#   non_solar: effective load = sum(agg_Total)/1000 (MWh)
+#   solar:     effective load = sum(pmax(agg_Net, 0))/1000 (MWh)
+# For hedging, we convert MW to MWh per interval: base_energy = baseVol*0.5, etc.
+# ------------------------------------------------------------------------------
+quarter_summary <- sim_data3 %>%
+  filter(Quarter %in% c("Q4_2024", "Q1_2025", "Q2_2025")) %>%
+  group_by(State, Retailer, Quarter) %>%
+  reframe(
+    effective_load = sum(if_else(Retailer == "solar",
+                                 pmax(agg_Net, 0),
+                                 agg_Total), na.rm = TRUE) / 1000,
+    base_energy = sum(baseVol * 0.5, na.rm = TRUE),
+    cap_energy = sum(capVol * 0.5, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    hedged_volume = base_energy + cap_energy,
+    unhedged = pmax(effective_load - hedged_volume, 0)
+  )
+
+# ------------------------------------------------------------------------------
+# 2. Prepare Data for Clustered Stacked Column Plot
+# We want to display, for each (State, Retailer, Quarter):
+#   - One bar for "Load" equal to effective_load.
+#   - One bar for "Hedged" that is stacked: base_energy (bottom), cap_energy (middle),
+#     and unhedged (top).
+# We'll create a data frame with a column 'BarType' set to either "Load" or "Hedged".
+# ------------------------------------------------------------------------------
+# Create a data frame for the "Load" bar.
+load_bar <- quarter_summary %>%
+  select(State, Retailer, Quarter, effective_load) %>%
+  mutate(
+    BarType = "Load",
+    Volume = effective_load
+  ) %>%
+  select(State, Retailer, Quarter, BarType, Volume)
+
+# Create a data frame for the "Hedged" bar.
+hedge_bar <- quarter_summary %>%
+  select(State, Retailer, Quarter, base_energy, cap_energy, unhedged) %>%
+  pivot_longer(
+    cols = c(base_energy, cap_energy, unhedged),
+    names_to = "HedgeComponent",
+    values_to = "Volume"
+  ) %>%
+  mutate(BarType = "Hedged") %>%
+  # We want the stacking order such that "base_energy" is on the bottom, then "cap_energy", then "unhedged".
+  mutate(HedgeComponent = factor(HedgeComponent, levels = c("base_energy", "cap_energy", "unhedged"),
+                                 labels = c("Base", "Cap", "Unhedged")))
+
+# Combine the two:
+combined_bar <- bind_rows(load_bar, hedge_bar)
+
+# Create a grouping variable for clustering.
+# For each unique combination of State, Retailer, Quarter, assign an x-axis category.
+combined_bar <- combined_bar %>%
+  mutate(Group = paste(State, Retailer, Quarter, sep = "_"))
+
+# To obtain side-by-side bars within each state (for the two BarTypes), we can create an x-pos offset.
+# For clarity we can create a numeric index for each group from the State.
+state_order <- sort(unique(combined_bar$State))
+combined_bar <- combined_bar %>%
+  mutate(
+    StateIndex = as.numeric(factor(State, levels = state_order)),
+    # We use BarType to offset: for "Load" we subtract 0.15, for "Hedged" we add 0.15.
+    x_pos = if_else(BarType == "Load", StateIndex - 0.15, StateIndex + 0.15)
+  )
+
+# ------------------------------------------------------------------------------
+# 3. Plotting: Create a Separate Plot for Each Quarter
+# ------------------------------------------------------------------------------
+quarter_list <- unique(combined_bar$Quarter)
+plot_list <- list()
+
+for (q in quarter_list) {
+  p <- ggplot(data = filter(combined_bar, Quarter == q),
+              aes(x = x_pos, y = Volume, fill = if_else(BarType == "Hedged", as.character(HedgeComponent), BarType))) +
+    # For the stacked bar, we use position = "stack" for the hedged components.
+    geom_bar(data = filter(combined_bar, Quarter == q, BarType == "Hedged"),
+             stat = "identity", width = 0.3, position = "stack") +
+    # For the load bar, we plot a single bar.
+    geom_bar(data = filter(combined_bar, Quarter == q, BarType == "Load"),
+             stat = "identity", width = 0.3) +
+    scale_fill_manual(
+      name = "Component",
+      values = c("Load" = "gray60", "Base" = "blue", "Cap" = "orange", "Unhedged" = "gray30")
+    ) +
+    scale_x_continuous(
+      breaks = 1:length(state_order),
+      labels = state_order,
+      name = "State"
+    ) +
+    labs(
+      title = paste("Load and Hedge Volumes in", q),
+      subtitle = "For each state and customer group; Bars are in MWh"
+    ) +
+    facet_wrap(~ Retailer, ncol = 2) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom"
+    )
+  plot_list[[q]] <- p
+  print(p)
+}
+```
+
+#### Hedged demand
+
+```{r}
+# -------------------------------------------------------------------
+# 1. Compute average demand (MW) and hedged MW for each quarter
+# -------------------------------------------------------------------
+quarter_summary_mw <- sim_data3 %>%
+  filter(Quarter %in% c("Q4_2024", "Q1_2025", "Q2_2025")) %>%
+  group_by(State, Retailer, Quarter) %>%
+  reframe(
+    # number of half‑hour intervals in the quarter:
+    n_int = n(),
+    # total energy in MWh over the quarter:
+    total_MWh = sum(
+      if_else(Retailer=="solar", pmax(agg_Net,0), agg_Total),
+      na.rm=TRUE
+    ) / 1000,
+    # average demand in MW = total_MWh / total_hours:
+    avg_demand_MW = total_MWh / (n_int * 0.5),
+    # since baseVol and capVol are MW held constant each interval,
+    # their per‑interval mean is just their quarter MW hedged:
+    base_MW = mean(baseVol, na.rm=TRUE),
+    cap_MW  = mean(capVol,  na.rm=TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    hedged_MW   = base_MW + cap_MW,
+    unhedged_MW = pmax(avg_demand_MW - hedged_MW, 0)
+  )
+
+# -------------------------------------------------------------------
+# 2. Build data for clustered stacked bar plot in MW
+# -------------------------------------------------------------------
+# Load bar = avg_demand_MW
+load_bar_mw <- quarter_summary_mw %>%
+  select(State, Retailer, Quarter, avg_demand_MW) %>%
+  rename(Volume_MW = avg_demand_MW) %>%
+  mutate(BarType="Demand")
+
+# Hedged bar broken into Base, Cap, Unhedged
+hedge_bar_mw <- quarter_summary_mw %>%
+  select(State, Retailer, Quarter, base_MW, cap_MW, unhedged_MW) %>%
+  pivot_longer(
+    cols = c(base_MW, cap_MW, unhedged_MW),
+    names_to  = "Component",
+    values_to = "Volume_MW"
+  ) %>%
+  mutate(
+    BarType   = "Hedged",
+    Component = factor(
+      Component,
+      levels = c("base_MW","cap_MW","unhedged_MW"),
+      labels = c("Base","Cap","Unhedged")
+    )
+  )
+
+combined_mw <- bind_rows(load_bar_mw, hedge_bar_mw) %>%
+  # index states so we can dodge the two bars per state
+  mutate(
+    StateIndex = as.numeric(factor(State, levels=unique(State))),
+    x_pos = if_else(BarType=="Demand",
+                    StateIndex - 0.15,
+                    StateIndex + 0.15)
+  )
+
+# -------------------------------------------------------------------
+# 3. Plot per‑quarter: average demand vs hedged MW
+# -------------------------------------------------------------------
+library(ggplot2)
+
+for (q in unique(combined_mw$Quarter)) {
+  ggplot(filter(combined_mw, Quarter==q), 
+         aes(x=x_pos, y=Volume_MW,
+             fill = if_else(BarType=="Hedged", as.character(Component), BarType))) +
+    # stacked hedged components
+    geom_bar(data = ~filter(.x, BarType=="Hedged"),
+             stat="identity", width=0.3, position="stack") +
+    # single bar for total demand
+    geom_bar(data = ~filter(.x, BarType=="Demand"),
+             stat="identity", width=0.3) +
+    scale_fill_manual(
+      name="",
+      values = c(
+        "Demand"   = "grey60",
+        "Base"     = "steelblue",
+        "Cap"      = "orange",
+        "Unhedged" = "darkgrey"
+      )
+    ) +
+    scale_x_continuous(
+      breaks = seq_along(unique(combined_mw$State)),
+      labels = unique(combined_mw$State),
+      name   = "State"
+    ) +
+    facet_wrap(~Retailer, ncol=2) +
+    labs(
+      title    = paste("Average Demand vs Hedged MW in", q),
+      y        = "MW",
+      subtitle = "Demand = avg MW over quarter; Hedged = Base + Cap; Unhedged residual"
+    ) +
+    theme_minimal() +
+    theme(legend.position="bottom") ->
+    p
+  print(p)
+}
+```
+
+Max demand
+
+```{r}
+# -------------------------------------------------------------------
+# 1.  Compute max demand (MW) and hedged MW for each quarter
+# -------------------------------------------------------------------
+quarter_summary_max <- sim_data3 %>%
+  filter(Quarter %in% c("Q4_2024", "Q1_2025", "Q2_2025")) %>%
+  group_by(State, Retailer, Quarter) %>%
+  reframe(
+    # instantaneous MW in each half‑hour:
+    inst_MW = if_else(
+      Retailer=="solar",
+      pmax(agg_Net, 0) * 2/1000,
+      agg_Total       * 2/1000
+    ),
+    # maximum demand over the quarter:
+    max_demand_MW = max(inst_MW, na.rm=TRUE),
+    # baseVol and capVol are already in MW each interval, so just take the mean
+    base_MW = mean(baseVol, na.rm=TRUE),
+    cap_MW  = mean(capVol,  na.rm=TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    hedged_MW   = base_MW + cap_MW,
+    unhedged_MW = pmax(max_demand_MW - hedged_MW, 0)
+  )
+
+# -------------------------------------------------------------------
+# 2.  Build data for clustered‐stacked bar plot in MW
+# -------------------------------------------------------------------
+# 2a) “Demand” bar = maximum demand
+load_bar_max <- quarter_summary_max %>%
+  select(State, Retailer, Quarter, max_demand_MW) %>%
+  rename(Volume_MW = max_demand_MW) %>%
+  mutate(BarType="Demand")
+
+# 2b) “Hedged” bar broken into Base, Cap, Unhedged
+hedge_bar_max <- quarter_summary_max %>%
+  select(State, Retailer, Quarter, base_MW, cap_MW, unhedged_MW) %>%
+  pivot_longer(
+    cols      = c(base_MW, cap_MW, unhedged_MW),
+    names_to  = "Component",
+    values_to = "Volume_MW"
+  ) %>%
+  mutate(
+    BarType   = "Hedged",
+    Component = factor(
+      Component,
+      levels = c("base_MW","cap_MW","unhedged_MW"),
+      labels = c("Base","Cap","Unhedged")
+    )
+  )
+
+combined_max <- bind_rows(load_bar_max, hedge_bar_max) %>%
+  mutate(
+    StateIndex = as.numeric(factor(State, levels=unique(State))),
+    x_pos      = if_else(BarType=="Demand",
+                         StateIndex - 0.15,
+                         StateIndex + 0.15)
+  )
+
+# -------------------------------------------------------------------
+# 3.  Plot per‑quarter: max demand vs hedged MW
+# -------------------------------------------------------------------
+for(q in unique(combined_max$Quarter)) {
+  data_q <- filter(combined_max, Quarter==q)
+
+  ggplot() +
+    # 1) the stacked “Hedged” bar
+    geom_bar(
+      data = filter(data_q, BarType=="Hedged"),
+      aes(x = x_pos, y = Volume_MW, fill = Component),  # <— map fill to the factor
+      stat     = "identity",
+      width    = 0.3,
+      position = "stack"
+    ) +
+    # 2) the single “Demand” bar
+    geom_bar(
+      data = filter(data_q, BarType=="Demand"),
+      aes(x = x_pos, y = Volume_MW),
+      stat  = "identity",
+      width = 0.3,
+      fill  = "grey60"
+    ) +
+    scale_fill_manual(
+      name   = "Hedge Component",
+      values = c(
+        "Base"     = "steelblue",   # bottom
+        "Cap"      = "orange",      # middle
+        "Unhedged" = "darkgrey"     # top
+      )
+    ) +
+    scale_x_continuous(
+      breaks = seq_along(unique(combined_mw$State)),
+      labels = unique(combined_mw$State),
+      name   = "State"
+    ) +
+    facet_wrap(~ Retailer, ncol=2) +
+    labs(
+      title    = paste("Quarterly Maximum Demand vs Hedged MW in", q),
+      subtitle = "Max demand = peak MW; Hedged = Base + Cap; Unhedged = residual",
+      y        = "MW"
+    ) +
+    theme_minimal() +
+    theme(legend.position="bottom") ->
+    p
+
+  print(p)
+}
+```
+
+#### Consumption profile over simulated period
+
+```{r}
+
+# ------------------------------
+# Step 1. Define simulated period boundaries in a dummy year.
+# (We assume here the simulated period is September 27 to April 15.)
+# ------------------------------
+sim_start_dummy <- as.POSIXct("2020-09-27 00:00:00", tz = "Australia/Brisbane")
+sim_end_dummy   <- as.POSIXct("2020-04-15 23:30:00", tz = "Australia/Brisbane")
+# Note: because the period spans across the new year, we'll use an OR filter.
+
+# ------------------------------
+# Step 2. Convert merge_key (format "MM-DD HH:MM") into a dummy POSIXct value using 2020.
+# ------------------------------
+sim_consumption <- customer_load %>%
+  mutate(dummy_time = as.POSIXct(paste("2020", merge_key),
+                                 format = "%Y %m-%d %H:%M",
+                                 tz = "Australia/Brisbane"))
+
+# ------------------------------
+# Step 3. Filter to include rows in the simulated period.
+# Because 2020-09-27 > 2020-04-15, we need an OR condition.
+# That is, include rows where dummy_time is on/after 2020-09-27 OR on/before 2020-04-15.
+# ------------------------------
+sim_consumption <- sim_consumption %>%
+  filter(dummy_time >= sim_start_dummy | dummy_time <= sim_end_dummy)
+
+# ------------------------------
+# Step 4. Create sim_date (from dummy_time) and time_of_day.
+# ------------------------------
+sim_consumption <- sim_consumption %>%
+  mutate(
+    sim_date = as.Date(dummy_time),
+    time_of_day = format(dummy_time, "%H:%M")
+  )
+
+# ------------------------------
+# Step 5. Daily Aggregation for Non-solar
+# For non-solar, use total consumption: avg_Total_Consmp.
+# ------------------------------
+non_solar_daily <- sim_consumption %>%
+  mutate(Retailer = "non_solar") %>%
+  group_by(sim_date, time_of_day, Retailer) %>%
+  summarise(
+    total_consumption = sum(avg_Total_Consmp, na.rm = TRUE),  # kWh per 30-minute interval
+    .groups = "drop"
+  )
+
+# ------------------------------
+# Step 6. Daily Aggregation for Solar
+# For solar, use pmax(avg_Net_Consmp, 0).
+# ------------------------------
+solar_daily <- sim_consumption %>%
+  mutate(Retailer = "solar") %>%
+  group_by(sim_date, time_of_day, Retailer) %>%
+  summarise(
+    total_consumption = sum(pmax(avg_Net_Consmp, 0), na.rm = TRUE),  # kWh per 30-minute interval
+    .groups = "drop"
+  )
+
+# ------------------------------
+# Step 7. Combine daily data.
+# ------------------------------
+daily_consumption <- bind_rows(non_solar_daily, solar_daily)
+
+# ------------------------------
+# Step 8. For each customer group and each 30-minute time slot,
+# compute the average daily total consumption.
+# ------------------------------
+avg_consumption <- daily_consumption %>%
+  group_by(Retailer, time_of_day) %>%
+  summarise(
+    avg_consumption = mean(total_consumption, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ------------------------------
+# Step 9. Convert time_of_day to a POSIXct object with a dummy date (e.g., 1970-01-01)
+# so that ggplot2 can treat it as time.
+# ------------------------------
+avg_consumption <- avg_consumption %>%
+  mutate(time_of_day = as.POSIXct(time_of_day, format = "%H:%M", tz = "Australia/Brisbane"))
+
+# ------------------------------
+# Step 10. Plot the average 24-hour consumption profile for each customer group.
+# ------------------------------
+p_consumption <- ggplot(avg_consumption, aes(x = time_of_day, y = avg_consumption, color = Retailer)) +
+  geom_line(linewidth = 1.2) +
+  scale_x_datetime(date_breaks = "2 hours", date_labels = "%H:%M") +
+  labs(
+    title = "Average 30-Minute Consumption Profile Over the Simulated Period",
+    subtitle = "Non-solar: Total consumption; Solar: max(net consumption, 0) (kWh per 30 min)",
+    x = "Time of Day",
+    y = "Average Consumption (kWh per 30 min)",
+    color = "Customer Group"
+  ) +
+  facet_wrap(~ Retailer, ncol = 1) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(p_consumption)
+```
+
+```{r}
+# Print Annual Peak Demand for Non-Solar:
+cat("Annual Peak Demand by Financial Year (Non-Solar):\n")
+annual_peak_by_FY_non_solar %>% print(n = Inf)
+cat("\nMean Annual Peak Demand (Non-Solar, in MW): ", annual_peak_retailer_non_solar, "\n\n")
+
+# Print Annual Peak Demand for Solar:
+cat("Annual Peak Demand by Financial Year (Solar):\n")
+annual_peak_by_FY_solar %>% print(n = Inf)
+cat("\nMean Annual Peak Demand (Solar, in MW): ", annual_peak_retailer_solar, "\n\n")
+
+# Print Base Swap Volumes by Quarter for Non-Solar:
+cat("Base Swap Volumes (Non-Solar, in MW) by Quarter:\n")
+q_windows %>% 
+  mutate(base_non_solar = unlist(base_swap_volumes$base_non_solar)) %>% 
+  select(Quarter, base_non_solar) %>% 
+  print(n = Inf)
+
+# Print Base Swap Volumes by Quarter for Solar:
+cat("\nBase Swap Volumes (Solar, in MW) by Quarter:\n")
+q_windows %>% 
+  mutate(base_solar = unlist(base_swap_volumes$base_solar)) %>% 
+  select(Quarter, base_solar) %>% 
+  print(n = Inf)
+
+# Print Cap Volumes by Quarter for Non-Solar:
+cat("\nCap Volumes (Non-Solar, in MW) by Quarter:\n")
+q_windows %>% 
+  mutate(cap_non_solar = cap_volumes$cap_non_solar) %>% 
+  select(Quarter, cap_non_solar) %>% 
+  print(n = Inf)
+
+# Print Cap Volumes by Quarter for Solar:
+cat("\nCap Volumes (Solar, in MW) by Quarter:\n")
+q_windows %>% 
+  mutate(cap_solar = cap_volumes$cap_solar) %>% 
+  select(Quarter, cap_solar) %>% 
+  print(n = Inf)
+```
