@@ -1,5 +1,4 @@
-# Wholesale‑Unit‑Cost Gap: Solar vs Non‑Solar Customers  
-_A 300‑customer case study using Ausgrid interval data & NEM spot prices (FY‑2024)_
+# Wholesale Cost of Solar vs Non-solar Customers
 
 ---
 
