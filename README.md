@@ -50,16 +50,16 @@ erDiagram
 
 <div align="center">
 
-![Unit cost – no export](figures/uc_gap_no_export.png)  
+![Unit cost – no export](20-figures/uc_gap_no_export.png)  
 _Figure 1a. Unit cost series (no export)_  
 
-![Unit cost difference – no export](figures/diff_no_export.png)  
+![Unit cost difference – no export](20-figures/diff_no_export.png)  
 _Figure 1b. Unit cost difference (no export)_  
 
-![Unit cost – with export](figures/uc_gap_with_export.png)  
+![Unit cost – with export](20-figures/uc_gap_with_export.png)  
 _Figure 2a. FiT‑adjusted series_
 
-![Unit cost difference – no export](figures/diff_with_export.png)  
+![Unit cost difference – no export](20-figures/diff_with_export.png)  
 _Figure 2b. Unit cost difference (with export)_  
 
 </div>
