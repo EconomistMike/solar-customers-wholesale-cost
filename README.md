@@ -28,7 +28,7 @@ We examine two cases:
 ---
 
 ## 3 | FY‑2024 headline numbers
-| Region | Non‑solar UC | Solar UC *(No‑export)* | Solar UC *(With‑export)* | Difference after FiT |
+| Region | Non‑solar UC | Solar UC *(No‑export)* | Solar UC *(With‑export)* | Diff after Export |
 |--------|-------------:|-----------------------:|-------------------------:|---------------:|
 | NSW | 147 | 176 | 155 | +5% |
 | VIC | 97 | 123 | 144 | +48% |
